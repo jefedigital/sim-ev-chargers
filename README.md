@@ -1,37 +1,52 @@
  # sim-ev-chargers
 
+sim-ev-chargers is a Python application that simulates electric vehicle charging stations to analyze charging patterns and infrastructure requirements. 
+
 ## Introduction
 
-sim-ev-chargers is a Git workflow assistant that integrates Large Language Models (LLMs) to enhance the electric vehicle charging development process. It aids in documentation generation and workflow enhancement to boost productivity.
+This project integrates Large Language Models to enhance the simulation of EV charging usage and provide data-driven insights. By leveraging LLMs, sim-ev-chargers can generate realistic charging demand profiles and station occupancy rates to help optimize charging infrastructure deployment.  
 
-This tool utilizes LLMs to provide features like automatic commit message generation and code review assistance without additional overhead for developers. By integrating seamlessly into the existing Git workflow, sim-ev-chargers aims to make EV charging projects easier to manage, share, and collaborate on.
+The tool aids in simulation configuration, result analysis, and documentation generation to streamline the overall workflow. The integration with LLMs enables more accurate modelling without extensive manual tuning.
 
 ## Key Features
 
-- Commit message generation - LLMs suggest concise, informative commit messages to clearly document changes
-- Code review assistance - LLMs analyze proposed code changes to identify potential improvements
-- Automatic documentation - Project documentation like READMEs are automatically kept up-to-date
-- Workflow enhancements - Integration with Git allows easy merging, branching, and collaboration
+- Configuration-driven simulation engine 
+- LLM-assisted simulation parameter tuning
+- Automatic report generation with key findings
+- Graphical representation of charging demand and infrastructure utilization 
+- Scalable and customizable for multiple use cases
 
 ## Installation
 
-To install sim-ev-chargers:
+sim-ev-chargers requires Python 3.6 or later. 
 
-1. Ensure Python 3.6+ and Git are installed
-2. Clone the repository 
-3. Install dependencies with `pip install -r requirements.txt`
-4. Run `python main.py` to start the application
+Install dependencies listed in requirements.txt:
+
+```
+pip install -r requirements.txt
+```
 
 ## Usage
 
-To generate a commit message:
+Basic simulation with default parameters:
 
 ```
-$ git add <files>
-$ sim-ev-chargers commit
+python main.py
 ```
 
-The tool will analyze changes and prompt you to accept/
+Custom configuration in config.json:
+
+```
+python main.py --config config.json
+```
+
+LLM-assisted simulation tuning:
+
+``` 
+python main.py --llm-tune
+```
+
+## Project Structure
 
 ---
 
