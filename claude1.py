@@ -54,6 +54,7 @@ def run_simulation(params):
     
     # Create charging stations
     charging_stations = [ChargingStation(env, i, 2) for i in range(params.num_charging_stations)]
+    print(f"Created {params.num_charging_stations} charging stations")
     
     # Create EVs and drivers
     for i in range(params.num_evs):
