@@ -1,6 +1,6 @@
  # sim-ev-chargers
 
-sim-ev-chargers is a Python application that simulates electric vehicle charging stations to analyze charging patterns and infrastructure requirements. 
+This is a demo of discrete event simulation, modeling a point-to-point electric vehicle charging network using SimPy.
 
 ## Installation
 
