@@ -1,1 +1,7 @@
+dash
+dash-bootstrap-components
+numpy
+pandas
+plotly
 simpy
+python-dotenv
