@@ -1,7 +1,9 @@
 dash
 dash-bootstrap-components
+matplotlib
 numpy
 pandas
 plotly
+scipy
 simpy
 python-dotenv

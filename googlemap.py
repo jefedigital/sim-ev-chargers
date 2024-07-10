@@ -4,7 +4,7 @@ from dotenv import dotenv_values
 secrets = dotenv_values('.env')
 
 def get_route_nycbos():
-    api_key = secrets('key_google_directions_api')
+    api_key = secrets['api_google_directions']
     origin = 'New York, NY'
     destination = 'Boston, MA'
     url = f'https://maps.googleapis.com/maps/api/directions/json?origin={origin}&destination={destination}&key={api_key}'
