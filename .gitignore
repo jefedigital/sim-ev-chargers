@@ -1,6 +1,11 @@
 # env files
 .env
 
+# misc folders
+drafts/
+qa/
+logs/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

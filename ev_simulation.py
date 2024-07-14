@@ -1,14 +1,19 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+# !pip install matplotlib numpy pandas scipy simpy sk-learn
+
+
 import simpy 
 import random
 import numpy as np
 import pandas as pd
 import logging
 import matplotlib.pyplot as plt
+import numpy as np
 import scipy.stats as stats
 from scipy.interpolate import make_interp_spline
+from sklearn.mixture import GaussianMixture
 import warnings
 
 
@@ -22,19 +27,47 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, message="invalid valu
 # Configure plotting style
 plt.style.use('seaborn-v0_8')
 
-# Vehicle models
-vehicle_models = {
-        'Model': ['S', 'M', 'L', 'XL'],
-        'Capacity': [55, 75, 95, 120],
-        'Efficiency': [0.17, 0.18, 0.19, 0.20],
-        'Share': [0.6, 0.2, 0.15, 0.5]
-    }
-vehicle_df = pd.DataFrame(vehicle_models)
 
-# Charger models
-charger_models = {
-  'kWh': [20, 50, 150]
+# Data
+
+# Vehicle models
+VEHICLE_MODELS = {
+    1: {
+        'Model': 'S',
+        'Capacity': 55,
+        'Efficiency': 0.17,
+        'Share': 0.6
+    },
+    2: {
+        'Model': 'M',
+        'Capacity': 75,
+        'Efficiency': 0.18,
+        'Share': 0.2
+    },
+    3: {
+        'Model': 'L',
+        'Capacity': 95,
+        'Efficiency': 0.19,
+        'Share': 0.15
+    },
+    4: {
+        'Model': 'XL',
+        'Capacity': 120,
+        'Efficiency': 0.20,
+        'Share': 0.5
+    }
 }
+
+# Chargers per station
+CHARGERS_PER_STATION = np.array([4,6,8,10,12,16])
+
+# Charger speeds
+CHARGER_SPEEDS = np.array([50,72,150,250])
+
+# Traffic distribution (Gaussian Mixture)
+gmm_df = pd.read_csv('https://raw.githubusercontent.com/jefedigital/sim-ev-chargers/main/data/traffic_ca_2020.csv')
+GMM = GaussianMixture(n_components=2)
+GMM.fit(gmm_df.values)
 
 
 ## Classes: Parameters, Drivers, Stations and Chargers
@@ -50,8 +83,15 @@ class SimulationParameters:
       self.num_chargers = 5
       self.loc_destination = 616 # km (SF to LA = 616.2)
       self.avg_speed = 104.585 # km/h (65 mph * 1.609)
-      self.trip_time_tolerance = 0.25 # trip time allowance % for charging vs. nonstop
+      self.station_time_limit = 35 # approx 10% of straight-shot drive time
       self.log_enabled = False
+      self.artifacts = False # get data dumps
+      self.dist_charger_speed_alpha = 3.5
+      self.dist_charger_speed_beta = 2
+      self.dist_num_chargers_alpha = 3.5
+      self.dist_num_chargers_beta = 2
+      self.dist_vehicles_alpha = 3
+      self.dist_vehicles_beta = 3.5
 
   def get_params():
     """Return all parameters as a dictionary."""
@@ -113,11 +153,13 @@ class ChargingStation:
 
 class Charger(simpy.Resource):
   """Represents a charger at a charging station."""
+  instances = []
   def __init__(self, env, id, charging_speed, release_time):
     super().__init__(env, capacity=1)
     self.id = id
     self.charging_speed = charging_speed
     self.release_time = release_time
+    Charger.instances.append(self)
 
   def update_release_time(self, charging_time):
     """Update the release time of the charger."""
@@ -144,6 +186,7 @@ class Driver:
       self.mileage = 0
       self.queue_time = 0
       self.charge_time = 0
+      self.station_time = 0
       self.charges = 0
       self.trip_start_time = 0
       self.trip_end_time = 0
@@ -154,10 +197,12 @@ class Driver:
      
   def drive_cycle(self):
     """Simulate the driving cycle of the driver."""
-    driver_log_msg(self, (f"Started trip in {self.model} with {self.battery_capacity} kWh battery"))
-
     # trip start vars
-    self.trip_start_time = self.env.now
+    self.trip_start_time = generate_trip_start_times(GMM,1)[0] * 60
+
+    yield self.env.timeout(self.trip_start_time)
+    driver_log_msg(self, (f"Started trip in {self.model} with {self.battery_capacity} kWh battery"))
+    
     stations_arr = np.array(self.station_list)
     self.num_stations = len(stations_arr) # for params sweep tracking
 
@@ -187,10 +232,13 @@ class Driver:
         # drive  
         drive_distance = dest - self.loc_current
         drive_time = abs(drive_distance) / self.avg_speed * 60 # minutes
+        
+        yield self.env.timeout(drive_time) # driving time
+        
+        self.trip_time += drive_time # adjust trip time
         self.loc_current += drive_distance # adjust location
         self.mileage += abs(drive_distance) # add mileage
         self.battery_level -= abs(drive_distance) * self.efficiency # adjust battery level
-        yield self.env.timeout(drive_time) # driving time
         driver_log_msg(self, "completed leg")
 
         if station:
@@ -211,10 +259,14 @@ class Driver:
               
                 charge_time = charge_amount / charger.charging_speed * 60 # in minutes
                 self.charge_time += charge_time
+                self.station_time += charge_time
+                self.trip_time += charge_time
                 station.charge_time += charge_time
 
                 queue_time = (self.env.now - queue_start) if (self.env.now - queue_start > charge_time) else 0
                 self.queue_time += queue_time
+                self.station_time += queue_time
+                self.trip_time += queue_time
                 station.queue_time += queue_time
 
                 yield self.env.timeout(charge_time)                    
@@ -228,7 +280,6 @@ class Driver:
 
     # trip end metrics
     self.trip_end_time = self.env.now
-    self.trip_time = self.trip_end_time - self.trip_start_time
     self.battery_level_end = self.battery_level
 
   def run(self):
@@ -249,12 +300,16 @@ class Driver:
 ## Simulation Functions
 
 
-def run_simulation(params, sweep = False):
+def run_simulation(params, sweep = False, **kwargs):
   """Run the main simulation"""
   setup_logging(params)
   driver_results_df = pd.DataFrame()
   station_results_df = pd.DataFrame()
 
+  # override any params
+  for key, value in kwargs.items(): 
+        setattr(params, key, value)
+    
   logging.getLogger('EVSimulation').log(level=logging.INFO, msg='## run starting ##')
 
   try:
@@ -264,12 +319,12 @@ def run_simulation(params, sweep = False):
       run_simulation_epoch(env, params)
       env.run(until=params.sim_duration)
   
-      driver_epoch_df = get_driver_results()
+      driver_epoch_df = get_driver_results(params)
       driver_epoch_df['epoch'] = epoch+1
       driver_results_df = pd.concat([driver_results_df, driver_epoch_df])
       Driver.delete_all()
   
-      station_epoch_df = get_station_results()
+      station_epoch_df = get_station_results(params)
       station_epoch_df['epoch'] = epoch+1
       station_results_df = pd.concat([station_results_df, station_epoch_df])
       ChargingStation.delete_all()
@@ -291,12 +346,25 @@ def run_simulation(params, sweep = False):
 
 def run_simulation_epoch(env, params):
   """Run a single epoch of the simulation."""
+  
   log_msg(env, '### epoch starting ###')
-  log_msg(env, f"Began simulation with parameters - drivers: {params.num_drivers}, stations: {params.num_stations}, chargers: {params.num_chargers}, destination: {params.loc_destination}, speed: {params.avg_speed}")
+  log_msg(env, f"Began simulation with parameters - drivers: {params.num_drivers}, stations: {params.num_stations}, destination: {params.loc_destination}, speed: {params.avg_speed}, charger speed params: {params.dist_charger_speed_alpha},{params.dist_charger_speed_beta}, num chargers params: {params.dist_num_chargers_alpha},{params.dist_num_chargers_beta}")
   
   # initialize charging station network
-  stations = [ChargingStation(env, id = n+1, location = np.round(np.linspace(0,params.loc_destination,params.num_stations),0)[n],
-                              chargers=[Charger(env, id = i+1, charging_speed=random.choice(charger_models['kWh']), release_time = i) for i in range(params.num_chargers)]) for n in range(params.num_stations)]
+  stations = [ChargingStation(env, 
+                              id = n+1, 
+                              location = np.round(np.linspace(0,params.loc_destination,params.num_stations+2),0)[n],
+                              chargers=[Charger(env, 
+                                                id = i+1, 
+                                                charging_speed=generate_discrete_beta_samples(CHARGER_SPEEDS,1,
+                                                                                              a=params.dist_charger_speed_alpha,
+                                                                                              b=params.dist_charger_speed_beta)[0], 
+                                                release_time = i) 
+                                        for i in range(generate_discrete_beta_samples(CHARGERS_PER_STATION,1,
+                                                                                      a=params.dist_num_chargers_alpha,
+                                                                                      b=params.dist_num_chargers_alpha)[0])
+                                       ]) 
+                                    for n in range(params.num_stations+2)]
 
   station_list = sorted([station.location for station in stations])
   log_msg(env, f"Stations at {station_list}")
@@ -305,55 +373,154 @@ def run_simulation_epoch(env, params):
   
   # initialize drivers and start their trips
   for id in range(params.num_drivers):
-      model, battery_capacity, efficiency, battery_level = generate_vehicle()
+      model, battery_capacity, efficiency, battery_level = generate_vehicle(params)
+    
       driver = Driver(env, id+1, station_list, charging_network, params.avg_speed, params.loc_destination, model, battery_capacity, efficiency, battery_level)
+ 
       env.process(driver.run())
 
 
-def run_simulation_sweep(params):
+def run_simulation_montecarlo(params, num_runs):
+  """Run a parameter sweep simulation."""
+  driver_results_df = pd.DataFrame()
+  station_results_df = pd.DataFrame()
+
+  try:
+       
+    for i in range(num_runs):
+
+      # randomize selected params
+      params.num_drivers = random.randint(100,2500)
+      params.num_stations = random.randint(5,500)
+      params.dist_charger_speed_alpha = random.uniform(2,4)
+      params.dist_num_chargers_alpha = random.uniform(2,4)
+      params.dist_vehicles_beta = random.uniform(2.5,3.5)
+
+      print(f'Monte Carlo {i+1} | Drivers {params.num_drivers}, Stations {params.num_stations}, Num Chargers a {params.dist_num_chargers_alpha}, Charger Speed a {params.dist_charger_speed_alpha}, Vehicles b {params.dist_vehicles_beta}') 
+
+      # run sim and epochs
+      results_dict = run_simulation(params)
+
+      # concat results
+      driver_df = results_dict['driver_results']
+      driver_df['mc_run'] = i+1
+      
+      station_df = results_dict['station_results']
+      station_df['mc_run'] = i+1
+      
+      driver_results_df = pd.concat([driver_results_df, driver_df])
+      station_results_df = pd.concat([station_results_df, station_df])
+
+  except Exception as e:
+    logging.getLogger('EVSimulation').error(f"Error in simulation: {str(e)}")
+    raise
+    
+  # qa
+  driver_results_df.to_csv('qa/montecarlo_driver_results.csv', index=False) if params.artifacts else None # save for qa
+  station_results_df.to_csv('qa/montecarlo_station_results.csv', index=False) if params.artifacts else None # save for qa
+
+  return {'driver_results': driver_results_df, 
+          'station_results': station_results_df}
+
+
+def run_simulation_sweep(params, sweep_variable):
   """Run a parameter sweep simulation."""
   sweep_results_df = pd.DataFrame()
 
-  for num_stations in range(1, 101):
-      params.num_stations = num_stations
-      # driver_results_df, driver_metrics_dict, station_results_df = run_simulation(params, sweep = True)
-      results_dict = run_simulation(params, sweep = True)
-      sweep_results_df = pd.concat([sweep_results_df, results_dict['driver_results']])
+  try:
+    
+    if sweep_variable == 'num_stations':
 
-  # constraints: no dead batteries, trip time under certain limit, minimum num_stations
-  trip_time_limit = params.loc_destination / params.avg_speed * 60 * (1 + params.trip_time_tolerance)
-  filter_results_df = sweep_results_df.groupby('num_stations').filter(
-      lambda x: x['db'].sum() == 0 and x['trip_time'].mean() <= trip_time_limit)
-  min_num_stations = filter_results_df['num_stations'].min()
-  min_sweep_results_df = filter_results_df[filter_results_df['num_stations'] == min_num_stations]
+      print(f'(num_stations will sweep from 1-50)')
+      
+      for num_stations in range(1, 51):
+        params.num_stations = num_stations
+        results_dict = run_simulation(params, sweep = True)
+        sweep_results_df = pd.concat([sweep_results_df, results_dict['driver_results']])
 
-  # return optimal params
-  sweep_params = params
-  setattr(sweep_params, 'num_stations', min_num_stations)
+      # constraints: no dead batteries, mean station_time under limit, minimum num_stations
+      filter_results_df = sweep_results_df.groupby('num_stations').filter(
+          lambda x: x['db'].sum() == 0 and x['station_time'].mean() <= params.station_time_limit)
+      min_num_stations = filter_results_df['num_stations'].min()
+      min_sweep_results_df = filter_results_df[filter_results_df['num_stations'] == min_num_stations]
+    
+      # return optimal params
+      sweep_params = params
+      setattr(sweep_params, 'num_stations', min_num_stations)
 
-  # sweep_results_df.to_csv('qa/sweep_results_df.csv', index=False) # save for qa
-  # min_sweep_results_df.to_csv('qa/min_sweep_results.csv', index=False) # save for qa
+    ## elif:
+
+  except Exception as e:
+    logging.getLogger('EVSimulation').error(f"Error in simulation: {str(e)}")
+    raise
+    
+  # qa
+  sweep_results_df.to_csv('qa/sweep_results_df.csv', index=False) if params.artifacts else None
+  min_sweep_results_df.to_csv('qa/min_sweep_results.csv', index=False) if params.artifacts else None
 
   0 if np.isnan(min_num_stations) else min_num_stations
+  
   return {'min_num_stations': min_num_stations, 
           'sweep_results': sweep_results_df,
           'sweep_params': sweep_params}
 
 
-def generate_vehicle():
-  """Generate a random vehicle based on the vehicle models."""
-  row = random.choices(vehicle_df['Model'], vehicle_df['Share'])
-  model= vehicle_df.loc[vehicle_df['Model'] == row[0]].values[0][0]
-  battery_capacity = vehicle_df.loc[vehicle_df['Model'] == row[0]].values[0][1] # kWh
-  efficiency = vehicle_df.loc[vehicle_df['Model'] == row[0]].values[0][2] # kWh/km
+def generate_vehicle(params):
+  data = list(VEHICLE_MODELS.keys())
+  vehicle_key = generate_discrete_beta_samples(data,1,
+                                               a=params.dist_vehicles_alpha,
+                                               b=params.dist_vehicles_beta)[0]
+  vehicle = VEHICLE_MODELS[vehicle_key]
+
+  model = vehicle['Model']
+  battery_capacity = vehicle['Capacity']
+  efficiency = vehicle['Efficiency']
   battery_level = round(random.uniform(0.6, 1) * battery_capacity,1) # random starting charge level 60-100%
   return(model, battery_capacity, efficiency, battery_level)
+
+
+def generate_trip_start_times(gmm, num_trips=1, min_value=0, max_value=24):
+    """Generate trip start times from fitted GMM, rejection sampling for valid hours."""
+    # orig wrote to handle all samples at once, too computationally expensive
+    sample_arr = np.array([])
+    
+    for i in range(num_trips):
+        good_sample = False
+
+        while not good_sample:
+            # sample from the new instance
+            samples, _ = gmm.sample(1)
+            samples = [s[0] for s in samples] # samples only, not the probabilities
+
+            # check if the samples are within the desired range
+            good_sample = all([min_value <= s < max_value for s in samples])
+
+        sample_arr = np.append(sample_arr, samples)
+
+    return sample_arr.tolist()
+
+
+def generate_discrete_beta_samples(data, num_samples=1, a=3, b=3):
+
+  # get samples from beta dist
+  samples = stats.beta.rvs(a, b, size=num_samples)
+  
+  # category breakpoints for beta dist interval [0,1]
+  breaks = [b + 1/len(data) for b in np.arange(0,1,1/len(data))]
+  
+  # categorize
+  samples_cat = [next(i for i, val in enumerate(breaks) if sample <= val) for sample in samples]
+  
+  # map to data values
+  samples_map = [data[c] for c in samples_cat]
+
+  return samples_map
 
 
 ## Calc Functions
 
 
-def get_driver_results():
+def get_driver_results(params):
   """Get the results for all drivers in the simulation."""
   data = {
       'num_stations': [], 
@@ -368,6 +535,7 @@ def get_driver_results():
       'trip_time': [],
       'queue_time': [],
       'charge_time': [],
+      'station_time': [],
       'charges': [],
       'db': []
   }
@@ -384,72 +552,101 @@ def get_driver_results():
       data['mileage'].append(driver.mileage)
       data['queue_time'].append(driver.queue_time)
       data['charge_time'].append(driver.charge_time)
+      data['station_time'].append(driver.station_time)
       data['charges'].append(driver.charges)
       data['db'].append(driver.db)
 
   df = pd.DataFrame(data)
-  # df.to_csv('qa/process_results.csv', index=False) # save for qa
+  df.to_csv('qa/driver_results.csv', index=False) if params.artifacts else None # save for qa
   return df
 
 
 def get_driver_metrics(df):
   """Calculate metrics from driver results."""
   avg_mileage = df['mileage'].mean()
+  
   avg_trip_time = df['trip_time'].mean()
-  max_trip_time = df['trip_time'].max()
-  std_trip_time = df['trip_time'].std()
   ci_trip_time = stats.t.interval(0.95, len(df)-1, avg_trip_time, stats.sem(df['trip_time']))
+  std_trip_time = df['trip_time'].std()
+  max_trip_time = df['trip_time'].max()
+  
   avg_queue_time = df['queue_time'].mean()
-  max_queue_time = df['queue_time'].max()
-  std_queue_time = df['queue_time'].std()
   ci_queue_time = stats.t.interval(0.95, len(df)-1, avg_queue_time, stats.sem(df['queue_time']))
+  std_queue_time = df['queue_time'].std()
+  max_queue_time = df['queue_time'].max()
+
   avg_charging_time = df['charge_time'].mean()
-  max_charging_time = df['charge_time'].max()
+  ci_charging_time = stats.t.interval(0.95, len(df)-1, avg_charging_time, stats.sem(df['charge_time']))
   std_charging_time = df['charge_time'].std()
-  ci_charging_time = stats.t.interval(0.95, len(df)-1, avg_queue_time, stats.sem(df['charge_time']))
+  max_charging_time = df['charge_time'].max()
+ 
+  avg_station_time = df['station_time'].mean()
+  ci_station_time = stats.t.interval(0.95, len(df)-1, avg_station_time, stats.sem(df['station_time']))
+  std_station_time = df['station_time'].std()
+  max_station_time = df['station_time'].max()
+ 
   avg_dead_batteries =  df['db'].mean()
 
   dict = {
       'avg_mileage': avg_mileage,
+   
       'avg_trip_time': avg_trip_time,
-      'max_trip_time': max_trip_time,
-      'std_trip_time': std_trip_time,
       'ci_trip_time': ci_trip_time,
+      'std_trip_time': std_trip_time,
+      'max_trip_time': max_trip_time,
+    
       'avg_queue_time': avg_queue_time,
-      'max_queue_time': max_queue_time,
-      'std_queue_time': std_queue_time,
       'ci_queue_time': ci_queue_time,
+      'std_queue_time': std_queue_time,
+      'max_queue_time': max_queue_time,
+    
       'avg_charging_time': avg_charging_time,
-      'max_charging_time': max_charging_time,
-      'std_charging_time': std_charging_time,
       'ci_charging_time': ci_charging_time,
+      'std_charging_time': std_charging_time,
+      'max_charging_time': max_charging_time,
+    
+      'avg_station_time': avg_station_time,
+      'ci_station_time': ci_station_time,
+      'std_station_time': std_station_time,
+      'max_station_time': max_station_time,
+    
       'avg_dead_batteries': avg_dead_batteries
   }
 
   dict_rounded = {k: (tuple(round(v,1) for v in value) if isinstance(value, tuple) else round(value,1)) for k, value in dict.items()}
-  
   return dict_rounded
 
 
-def get_station_results():
+def get_station_results(params):
   """Get the results for all charging stations in the simulation."""
   data = {
       'station_id': [],
       'location': [],
       'visits': [],
       'charge_time': [],
-      'queue_time': []
+      'queue_time': [],
+      'num_chargers': [],
+      'charger_speeds': []
   }
-  
+
   for station in ChargingStation.instances:
-      data['station_id'].append(station.id)
-      data['location'].append(station.location)
-      data['visits'].append(station.visits)
-      data['charge_time'].append(station.charge_time)
-      data['queue_time'].append(station.queue_time)
+    num_chargers = 0
+    charger_speeds = []
+
+    for charger in station.chargers:
+      num_chargers +=1
+      charger_speeds.append(charger.charging_speed)
+
+    data['station_id'].append(station.id)
+    data['location'].append(station.location)
+    data['visits'].append(station.visits)
+    data['charge_time'].append(station.charge_time)
+    data['queue_time'].append(station.queue_time)
+    data['num_chargers'].append(num_chargers - 2) # less the start/end points
+    data['charger_speeds'].append(charger_speeds) # a list
 
   df = pd.DataFrame(data)
-  df.to_csv('qa/station_results.csv', index=False) # save for qa
+  df.to_csv('qa/station_results.csv', index=False) if params.artifacts else None # save for qa
   return df
 
 
@@ -466,19 +663,28 @@ def get_station_metrics(df):
 ## Graphing Functions
 
 
-def get_driver_results_plot(df):
-  """Generate plots for driver results."""
-  fig, axs = plt.subplots(1,3,figsize=(10, 6))
+def get_driver_results_hist(df):
+  """Generate hists for driver results."""
+  fig, axs = plt.subplots(1,6,figsize=(10, 4))
 
   # Plot the histograms
-  axs[0].hist(df['trip_time'], bins=30, color='grey')
-  axs[0].set_title('Trip Time')
+  axs[0].hist(df['battery_capacity'], bins=30, color='grey')
+  axs[0].set_title('Battery Capacity')
+
+  axs[1].hist(df['trip_start_time'], bins=30, color='grey')
+  axs[1].set_title('Trip Start Time')
+
+  axs[2].hist(df['trip_end_time'], bins=30, color='grey')
+  axs[2].set_title('Trip End Time')
  
-  axs[1].hist(df['queue_time'], bins=30, color='grey')
-  axs[1].set_title('Queue Time')
+  axs[3].hist(df['queue_time'], bins=30, color='grey')
+  axs[3].set_title('Total Queue Time')
   
-  axs[2].hist(df['charge_time'], bins=30, color='grey')
-  axs[2].set_title('Charge Time')
+  axs[4].hist(df['charge_time'], bins=30, color='grey')
+  axs[4].set_title('Total Charge Time')
+
+  axs[5].hist(df['trip_time'], bins=30, color='grey')
+  axs[5].set_title('Total Trip Time')
 
   plt.close(fig)
   return fig
@@ -486,7 +692,7 @@ def get_driver_results_plot(df):
 
 def get_station_metrics_plot(df):
   """Generate a plot for station metrics."""
-  fig, ax = plt.subplots(figsize=(10, 6))
+  fig, ax = plt.subplots(figsize=(8, 8))
   ax2 = ax.twinx()
   
   df['visits'].plot(kind='bar', color='grey', ax=ax, position=1)
@@ -502,6 +708,23 @@ def get_station_metrics_plot(df):
   ax2.legend(['Avg Queue Time', 'Avg Charge Time'], loc='upper left')
   
   ax2.grid(False)
+
+  plt.close(fig)
+  return fig
+
+
+def get_station_metrics_hist(df):
+  """Generate hists for station results."""
+  fig, axs = plt.subplots(1,2,figsize=(10, 6))
+
+  all_charger_speeds = [item for sublist in df['charger_speeds'] for item in sublist]
+  
+  # Plot the histograms
+  axs[0].hist(df['num_chargers'], bins=30, color='grey')
+  axs[0].set_title('Chargers per Station')
+
+  axs[1].hist(all_charger_speeds, bins=30, color='grey')
+  axs[1].set_title('Charger Speeds')
 
   plt.close(fig)
   return fig
@@ -529,7 +752,7 @@ def get_sweep_graphs_plot(df,ax,min_num_stations,xcol,ycol,xlab,ylab,title):
 
 def get_sweep_plots_grid(df,min_num_stations):
   """Generate a grid of sweep plots."""
-  fig, axs = plt.subplots(2, 2, figsize=(10, 8))
+  fig, axs = plt.subplots(2, 2, figsize=(10, 6))
   get_sweep_graphs_plot(df, axs[0,0], min_num_stations, 'num_stations','trip_time','Num Stations','Mean Trip Time','Mean Trip Times by Num Stations')
   get_sweep_graphs_plot(df, axs[0,1], min_num_stations, 'num_stations','queue_time','Num Stations','Mean Queue Time','Mean Queue Times by Num Stations')
   get_sweep_graphs_plot(df, axs[1,0], min_num_stations, 'num_stations','charge_time','Num Stations','Mean Charge Time','Mean Charge Times by Num Stations')
@@ -556,7 +779,7 @@ def setup_logging(params):
     )
 
 def driver_log_msg(driver, message):
-    status = "Driver %s [Loc: %.1f Mlg: %.1f Bat: %.1f QueT: %.1f ChgT: %.1f] - %s" % (driver.id, driver.loc_current, driver.mileage, driver.battery_level, driver.queue_time, driver.charge_time, message)
+    status = "Driver %s [Loc: %.1f Mlg: %.1f Bat: %.1f QueT: %.1f ChgT: %.1f StaT: %.1f TrpT: %.1f] - %s" % (driver.id, driver.loc_current, driver.mileage, driver.battery_level, driver.queue_time, driver.charge_time, driver.station_time, driver.trip_time, message)
     log_msg(driver.env, status)
 
 
@@ -574,7 +797,8 @@ def run_scenario(**kwargs):
   if 'params' in kwargs:
     params = kwargs['params'] # take a full params object (like sweep_params)
   else:
-    params = SimulationParameters() # load defaults and apply kwargs
+    params = SimulationParameters()
+    # overrride any params
     for key, value in kwargs.items(): 
         setattr(params, key, value)
 
@@ -584,15 +808,19 @@ def run_scenario(**kwargs):
       print(f"{param}: {value}")
 
   results_dict = run_simulation(params)
-  results_dict['driver_results_plot'] = get_driver_results_plot(results_dict['driver_results'])
+  
+  results_dict['driver_results_hist'] = get_driver_results_hist(results_dict['driver_results'])
   results_dict['station_metrics_plot'] = get_station_metrics_plot(results_dict['station_metrics'])
+  results_dict['station_metrics_hist'] = get_station_metrics_hist(results_dict['station_results'])
   
   return results_dict
 
 
-def run_sweep(**kwargs):
+def run_sweep(sweep_variable, **kwargs):
   """Run a parameter sweep simulation."""
-  params = SimulationParameters() # load defaults
+  params = SimulationParameters()
+
+  # overrride any params
   for key, value in kwargs.items():
         setattr(params, key, value)
 
@@ -601,9 +829,29 @@ def run_sweep(**kwargs):
   for param, value in vars(params).items():
       print(f"{param}: {value}")
 
-  print('(num_stations will sweep from 1-100)')
-
-  results_dict = run_simulation_sweep(params)
+  results_dict = run_simulation_sweep(params, sweep_variable)
   results_dict['sweep_plots'] = get_sweep_plots_grid(results_dict['sweep_results'], results_dict['min_num_stations'])
   
   return results_dict
+
+
+def run_montecarlo(num_runs, **kwargs):
+  """Run a monte carlo simulation."""
+  params = SimulationParameters() # load defaults
+
+  # overrride any params
+  for key, value in kwargs.items():
+        setattr(params, key, value)
+
+  print('Running Monte Carlo')
+
+  results_dict = run_simulation_montecarlo(params, num_runs)
+  
+  results_dict['driver_results_hist'] = get_driver_results_hist(results_dict['driver_results'])
+  results_dict['station_metrics_hist'] = get_station_metrics_hist(results_dict['station_results'])
+  
+  return results_dict
+
+
+## End Code
+
